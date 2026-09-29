@@ -27,11 +27,10 @@ check-generated: generate
 	git diff --exit-code -- client/gen || (echo "client/gen is out of date with the proto"; exit 1)
 
 # Platform-owned files must match what the platform rendered from service.yaml
-# and the proto. A mismatch means one was edited by hand, or service.yaml or
-# the proto changed and the platform has not regenerated yet.
+# and the proto. A hand edit fails; a change the platform has not regenerated
+# yet is told apart (see .platform/check-stamp.sh).
 check-stamp:
-	@sha256sum --check --quiet .platform/sha256sums || \
-	  (echo "platform-owned files do not match service.yaml; the platform regenerates them on push"; exit 1)
+	@.platform/check-stamp.sh
 
 # Every environment's manifests must build: the overlays patch the base, and
 # a patch whose path no longer exists fails here, not at deploy time.

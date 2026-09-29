@@ -14,17 +14,29 @@ on:
   pull_request:
 permissions:
   contents: read
+# A newer push to the same branch supersedes a running check, to save
+# runners. Correctness does not depend on it: check-stamp tells a pending
+# regeneration apart from a hand edit on its own.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      current: ${{ steps.stamp.outputs.current }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
       - run: make tools
-      - run: make check-stamp
+      - id: stamp
+        run: make check-stamp
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
       - run: make manifests
       - run: make check-generated
       - run: make test
@@ -45,6 +57,8 @@ jobs:
 
   e2e:
     needs: [test, image]
+    # A commit the platform has already superseded has stale platform files.
+    if: needs.test.outputs.current == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -61,12 +75,33 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, image, e2e]
     runs-on: ubuntu-latest
+    # Publishes run one at a time, and only the newest commit on main
+    # publishes and pins: an older run that finishes last steps aside
+    # instead of moving dev backwards.
+    concurrency:
+      group: publish-main
+      cancel-in-progress: false
     permissions:
       contents: write   # pin dev's image
       packages: write   # push to GHCR
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Is this still the newest commit on main?
+        id: newest
+        run: |
+          git fetch -q origin main
+          # Commits after this one, not counting delivery's own pins.
+          newer="$(git log --format=%s "$GITHUB_SHA..origin/main" | grep -vc '^delivery: ' || true)"
+          if [ "$newer" -gt 0 ]; then
+            echo "main has $newer newer commit(s): their run publishes and pins"
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish ghcr.io/smallstepgiantleap/ledger for amd64 and arm64
+        if: steps.newest.outputs.newest == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -77,15 +112,26 @@ jobs:
             --label "org.opencontainers.image.source=$source" \
             --annotation "index:org.opencontainers.image.source=$source" \
             -t ghcr.io/smallstepgiantleap/ledger:main -t "ghcr.io/smallstepgiantleap/ledger:sha-${GITHUB_SHA::12}" \
-            --metadata-file meta.json --push .
-          echo "DIGEST=$(jq -r '."containerimage.digest"' meta.json)" >> "$GITHUB_ENV"
+            --metadata-file "$RUNNER_TEMP/meta.json" --push .
+          echo "DIGEST=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")" >> "$GITHUB_ENV"
       - name: Pin dev to the published digest
+        if: steps.newest.outputs.newest == 'true'
         run: |
-          sed -i "s#^  value: .*#  value: ghcr.io/smallstepgiantleap/ledger@$DIGEST#" deploy/envs/dev/image.yaml
-          git add deploy/envs/dev/image.yaml
-          git diff --cached --quiet && exit 0
-          git -c user.name="vikrant delivery" -c user.email="delivery@users.noreply.github.com" \
-            commit -q -m "delivery: dev runs sha-${GITHUB_SHA::12}" -m "ghcr.io/smallstepgiantleap/ledger@$DIGEST"
-          # Only delivery writes this file, so a rebase never conflicts.
-          for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          git config user.name "vikrant delivery"
+          git config user.email "delivery@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            if [ "$(git log --format=%s "$GITHUB_SHA..origin/main" | grep -vc '^delivery: ' || true)" -gt 0 ]; then
+              echo "main moved past this commit while publishing: the newer run pins"
+              exit 0
+            fi
+            # Rebuild the pin on top of main as it is now, never merge one.
+            git checkout -q -B pin origin/main
+            sed -i "s#^  value: .*#  value: ghcr.io/smallstepgiantleap/ledger@$DIGEST#" deploy/envs/dev/image.yaml
+            git add deploy/envs/dev/image.yaml
+            git diff --cached --quiet && exit 0
+            git commit -q -m "delivery: dev runs sha-${GITHUB_SHA::12}" -m "ghcr.io/smallstepgiantleap/ledger@$DIGEST"
+            git push -q origin pin:main && exit 0
+            sleep 5
+          done
           exit 1

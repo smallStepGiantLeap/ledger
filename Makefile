@@ -4,7 +4,7 @@ IMAGE ?= ledger:dev
 BIN   := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: tools build test generate check-generated check-stamp image run e2e e2e-down
+.PHONY: tools build test generate check-generated check-stamp manifests image run e2e e2e-down
 
 tools: ## the exact code generators the platform used
 	GOBIN=$(BIN) go install github.com/bufbuild/buf/cmd/buf@v1.64.0
@@ -32,6 +32,13 @@ check-generated: generate
 check-stamp:
 	@sha256sum --check --quiet .platform/sha256sums || \
 	  (echo "platform-owned files do not match service.yaml; the platform regenerates them on push"; exit 1)
+
+# Every environment's manifests must build: the overlays patch the base, and
+# a patch whose path no longer exists fails here, not at deploy time.
+manifests:
+	@for env in deploy/envs/*/; do \
+	  kubectl kustomize "$$env" >/dev/null || { echo "$$env does not build"; exit 1; }; \
+	done
 
 image:
 	docker build --provenance=false -t $(IMAGE) .

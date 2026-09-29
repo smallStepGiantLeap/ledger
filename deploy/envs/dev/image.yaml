@@ -1,0 +1,6 @@
+# The image dev runs. Owned by delivery: CI writes dev's on every merge
+# to main, and promotion copies a tested digest to the next environment.
+# vikrant writes this file once and never overwrites it.
+- op: replace
+  path: /spec/template/spec/containers/0/image
+  value: ghcr.io/smallstepgiantleap/ledger:main

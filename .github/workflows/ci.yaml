@@ -4,7 +4,9 @@
 # match the proto, platform-owned files match service.yaml, the toxic-client
 # conformance tests pass, the image runs as non-root with one layer on top
 # of its base, and in a kind cluster with the real mesh every access rule,
-# PSS, autoscaling and a canary rollout behave as service.yaml says.
+# PSS, autoscaling and a canary rollout behave as service.yaml says. On
+# main, only after all of that holds, the image is published and dev is
+# pinned to it; Argo CD in the dev cluster deploys it from there.
 # Actions are pinned by commit SHA.
 name: ci
 on:
@@ -23,6 +25,7 @@ jobs:
           go-version-file: go.mod
       - run: make tools
       - run: make check-stamp
+      - run: make manifests
       - run: make check-generated
       - run: make test
 
@@ -52,3 +55,37 @@ jobs:
           config: e2e/kind.yaml
       - name: Run in a box and prove the guarantees
         run: e2e/run.sh
+
+  publish:
+    # Only main, and only an image every check above has proven.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, image, e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # pin dev's image
+      packages: write   # push to GHCR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Publish ghcr.io/smallstepgiantleap/ledger for amd64 and arm64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use --driver docker-container >/dev/null
+          source="https://github.com/$GITHUB_REPOSITORY"
+          docker buildx build --platform linux/amd64,linux/arm64 --provenance=false \
+            --label "org.opencontainers.image.source=$source" \
+            --annotation "index:org.opencontainers.image.source=$source" \
+            -t ghcr.io/smallstepgiantleap/ledger:main -t "ghcr.io/smallstepgiantleap/ledger:sha-${GITHUB_SHA::12}" \
+            --metadata-file meta.json --push .
+          echo "DIGEST=$(jq -r '."containerimage.digest"' meta.json)" >> "$GITHUB_ENV"
+      - name: Pin dev to the published digest
+        run: |
+          sed -i "s#^  value: .*#  value: ghcr.io/smallstepgiantleap/ledger@$DIGEST#" deploy/envs/dev/image.yaml
+          git add deploy/envs/dev/image.yaml
+          git diff --cached --quiet && exit 0
+          git -c user.name="vikrant delivery" -c user.email="delivery@users.noreply.github.com" \
+            commit -q -m "delivery: dev runs sha-${GITHUB_SHA::12}" -m "ghcr.io/smallstepgiantleap/ledger@$DIGEST"
+          # Only delivery writes this file, so a rebase never conflicts.
+          for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          exit 1

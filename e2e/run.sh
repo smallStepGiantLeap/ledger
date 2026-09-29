@@ -17,6 +17,7 @@ cd "$(dirname "$0")/.."
 
 NAME=ledger
 ORG=smallStepGiantLeap
+REGISTRY=ghcr.io/smallstepgiantleap
 CLUSTER="${CLUSTER:-vikrant-e2e}"
 CTX="kind-$CLUSTER"
 ISTIO_VERSION=1.31.1
@@ -94,18 +95,18 @@ image() { # dir name: build and load <name>:e2e
   kind load docker-image --name "$CLUSTER" "$2:e2e" >/dev/null
 }
 
-deploy() { # dir name: apply the repo's own deploy/ with the e2e image
-  # The base's images rule has already renamed the image to its registry
-  # name, so the overlay matches that name.
-  local overlay="$WORK/deploy-$2"
+deploy() { # dir name: apply what the repo ships to staging, with the e2e image
+  local overlay="$WORK/deploy-$2" env="$1/deploy/envs/staging"
+  # A dependency rendered before environments existed has only deploy/.
+  [[ -d "$env" ]] || env="$1/deploy"
   mkdir -p "$overlay"
-  # Two replicas instead of the default three: enough to show spread and
-  # disruption rules, lighter on a laptop.
+  # Two replicas: enough to show spread and disruption rules, light on a
+  # laptop. Everything else (canary pace, analysis, policy) is staging's.
   cat >"$overlay/kustomization.yaml" <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-resources: [$(realpath --relative-to="$overlay" "$1/deploy" 2>/dev/null || python3 -c "import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$1/deploy" "$overlay")]
-images: [{name: ghcr.io/$(printf %s "$ORG" | tr '[:upper:]' '[:lower:]')/$2, newName: $2, newTag: e2e}]
+resources: [$(python3 -c "import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$env" "$overlay")]
+images: [{name: $REGISTRY/$2, newName: $2, newTag: e2e}]
 patches:
   - target: {kind: Rollout, name: $2}
     patch: '[{"op":"replace","path":"/spec/replicas","value":2}]'
@@ -160,16 +161,40 @@ decoy() { # an undeclared service this one must not be able to reach
 
 restricted='{"runAsNonRoot":true,"runAsUser":65532,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
 
-probe_as() { # namespace serviceaccount app -- probe args: run as that identity
-  local ns=$1 sa=$2 app=$3 pod="probe-$RANDOM$RANDOM"
-  shift 4
+start_probe() { # namespace serviceaccount app pod -- probe args: a probe pod running as that identity
+  local ns=$1 sa=$2 app=$3 pod=$4
+  shift 5
   local args
   args="$(printf '"%s",' "$@")"
   k -n "$ns" run "$pod" --image=probe:e2e --image-pull-policy=IfNotPresent --restart=Never --labels="app=$app" \
     --overrides="{\"spec\":{\"serviceAccountName\":\"$sa\",\"securityContext\":{\"runAsNonRoot\":true,\"seccompProfile\":{\"type\":\"RuntimeDefault\"}},\"containers\":[{\"name\":\"$pod\",\"image\":\"probe:e2e\",\"args\":[${args%,}],\"securityContext\":$restricted}]}}" >/dev/null
-  wait_terminated "$ns" "$pod" "{.status.containerStatuses[?(@.name==\"$pod\")].state.terminated.reason}"
-  k -n "$ns" logs "$pod" -c "$pod" | tail -1
-  k -n "$ns" delete pod "$pod" --wait=false >/dev/null
+}
+
+finish_probe() { # namespace pod seconds: wait for the probe to exit and print its result
+  wait_terminated "$1" "$2" "{.status.containerStatuses[?(@.name==\"$2\")].state.terminated.reason}" "$3"
+  k -n "$1" logs "$2" -c "$2" | tail -1
+  k -n "$1" delete pod "$2" --wait=false >/dev/null
+}
+
+probe_as() { # namespace serviceaccount app -- probe args: run as that identity
+  local pod="probe-$RANDOM$RANDOM"
+  start_probe "$1" "$2" "$3" "$pod" "${@:4}"
+  finish_probe "$1" "$pod" 60
+}
+
+drain_under_load() { # namespace serviceaccount app -- probe args: drain a node running this service mid-traffic
+  local ns=$1 pod="drain-$RANDOM$RANDOM" node
+  start_probe "$1" "$2" "$3" "$pod" "${@:4}" -loop 60s
+  k -n "$ns" wait --for=condition=Ready "pod/$pod" --timeout=60s >/dev/null
+  sleep 5
+  node="$(k -n "$NAME" get pod -l app="$NAME" --field-selector=status.phase=Running -o jsonpath='{.items[0].spec.nodeName}')"
+  log "draining $node (only $NAME's pods are evicted) while $3 keeps calling"
+  # Eviction honours the PDB. The cordoned node's taint is excluded from
+  # spread (nodeTaintsPolicy: Honor), so the replacement lands elsewhere.
+  k drain "$node" --pod-selector="app=$NAME" --ignore-daemonsets --delete-emptydir-data --timeout=120s >/dev/null 2>&1 ||
+    log "drain of $node did not complete"
+  k uncordon "$node" >/dev/null
+  finish_probe "$ns" "$pod" 90
 }
 
 probe_inside() { # -- probe args: run inside this service's own pod
@@ -184,8 +209,8 @@ probe_inside() { # -- probe args: run inside this service's own pod
   k -n "$NAME" logs "$pod" -c "$c" | tail -1
 }
 
-wait_terminated() { # namespace pod jsonpath
-  local deadline=$((SECONDS + 60))
+wait_terminated() { # namespace pod jsonpath [seconds]
+  local deadline=$((SECONDS + ${4:-60}))
   while ((SECONDS < deadline)); do
     [[ -n "$(k -n "$1" get pod "$2" -o jsonpath="$3" 2>/dev/null)" ]] && return 0
     sleep 1
@@ -204,13 +229,14 @@ matches() { # expectation output
   blocked) [[ "$2" =~ ^CODE\ (PermissionDenied|Unavailable|DeadlineExceeded) ]] ;;
   dial-ok) [[ "$2" == "DIAL ok" ]] ;;
   dial-fail) [[ "$2" == DIAL\ failed* ]] ;;
+  no-errors) [[ "$2" =~ LOOP\ calls=[1-9][0-9]*\ failed=0\  ]] ;;
   esac
 }
 
 check() { # expectation why -- command...: retried while the mesh converges
   local expect=$1 why=$2 out="" attempt
   shift 3
-  for attempt in 1 2 3 4 5; do
+  for attempt in $(seq "${ATTEMPTS:-5}"); do
     out="$("$@" 2>&1 || true)"
     matches "$expect" "$out" && break
     sleep 3
@@ -303,6 +329,12 @@ assert "the same pod with NET_ADMIN is refused (enforcement is live)" -- refused
 assert "every $NAME pod is running in the restricted namespace" -- all_running_restricted
 
 echo
+echo "== environments (the e2e runs staging; the others must apply too)"
+for env in deploy/envs/*/; do
+  assert "deploy/envs/$(basename "$env") is accepted by the API server (server-side dry run)" -- k apply -k "$env" --dry-run=server
+done
+
+echo
 echo "== who may call $NAME (inbound)"
 check reach "echo is granted ledger.v1.LedgerService/GetBalance" -- probe_as echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
 check deny "echo is not granted ledger.v1.LedgerService/Transfer: Istio denies it by identity" -- probe_as echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/Transfer
@@ -311,11 +343,12 @@ check deny "a pod in echo wearing app=echo but running as another service accoun
 
 echo
 echo "== what $NAME may call (outbound, from inside its own pod)"
+check dial-ok "api.stripe.com:443 is declared in outbound" -- probe_inside -- -dial api.stripe.com:443
 check blocked "decoy is not in outbound: the Sidecar and NetworkPolicy both refuse it" -- probe_inside -- -target decoy.decoy.svc.cluster.local:50051 -method /grpc.health.v1.Health/Check
 check dial-fail "example.com is not in outbound" -- probe_inside -- -dial example.com:443
 
 echo
-echo "== autoscaling and rollout"
+echo "== autoscaling and rollout (staging's canary pace)"
 assert "KEDA scales the Rollout on in-flight RPCs (ScaledObject Ready)" -- eventually 120 scaledobject_ready
 old="$(k -n "$NAME" get rollout "$NAME" -o jsonpath='{.status.stableRS}')"
 k -n "$NAME" patch rollout "$NAME" --type merge -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"e2e/revision\":\"$RANDOM\"}}}}}" >/dev/null
@@ -324,5 +357,9 @@ assert "the canary is promoted: analysis passes and the new revision is stable a
 assert "after promotion the stable Service takes all traffic again" -- eventually 30 canary_weight 0
 
 echo
-echo "$passed passed, $failed failed (of $((6 + 7)) checks)"
+echo "== node drain"
+ATTEMPTS=1 check no-errors "echo keeps calling ledger.v1.LedgerService/GetBalance while a node running ledger drains: no call fails" -- drain_under_load echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
+
+echo
+echo "$passed passed, $failed failed (of $((8 + 7 + 3)) checks)"
 [[ "$failed" -eq 0 ]]

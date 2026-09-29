@@ -8,9 +8,11 @@
 //
 //	probe -target echo.echo.svc.cluster.local:50051 -method /echo.v1.EchoService/Echo
 //	probe -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/Watch -stream
-//	probe -dial api.github.com:443
+//	probe -dial api.stripe.com:443
+//	probe -target echo.echo.svc.cluster.local:50051 -method /echo.v1.EchoService/Echo -loop 60s
 //
-// Output is one line: "CODE <grpc code>" or "DIAL ok|failed <error>".
+// Output is one line: "CODE <grpc code>", "DIAL ok|failed <error>", or with
+// -loop, "LOOP calls=<n> failed=<n> codes=<code>:<n>,...".
 package main
 
 import (
@@ -20,9 +22,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -33,7 +38,9 @@ func main() {
 	method := flag.String("method", "", "full method path, /package.Service/Method")
 	stream := flag.Bool("stream", false, "call as a streaming method")
 	dial := flag.String("dial", "", "instead of calling, complete a TLS handshake with host:port")
-	timeout := flag.Duration("timeout", 5*time.Second, "deadline")
+	timeout := flag.Duration("timeout", 5*time.Second, "deadline, per call with -loop")
+	loop := flag.Duration("loop", 0, "call repeatedly for this long, on one connection, and tally the codes")
+	interval := flag.Duration("interval", 50*time.Millisecond, "pause between calls with -loop")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -65,12 +72,57 @@ func main() {
 		os.Exit(2)
 	}
 	defer cc.Close()
+	if *loop > 0 {
+		tally(cc, *method, *stream, *loop, *interval, *timeout)
+		return
+	}
 	if *stream {
 		err = callStream(ctx, cc, *method)
 	} else {
 		err = cc.Invoke(ctx, *method, &emptypb.Empty{}, &emptypb.Empty{}, grpc.WaitForReady(true))
 	}
 	fmt.Println("CODE", status.Code(err))
+}
+
+// failure is what a caller would see as the service being unavailable. Any
+// other code, even Unimplemented, is an answer from the service itself.
+var failure = []codes.Code{codes.Unavailable, codes.DeadlineExceeded, codes.Internal, codes.Unknown, codes.Canceled}
+
+func tally(cc *grpc.ClientConn, method string, stream bool, d, interval, timeout time.Duration) {
+	counts := map[codes.Code]int{}
+	calls, failed := 0, 0
+	var first, last time.Time
+	var firstErr error
+	for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(interval) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		var err error
+		if stream {
+			err = callStream(ctx, cc, method)
+		} else {
+			err = cc.Invoke(ctx, method, &emptypb.Empty{}, &emptypb.Empty{}, grpc.WaitForReady(true))
+		}
+		cancel()
+		c := status.Code(err)
+		counts[c]++
+		calls++
+		if slices.Contains(failure, c) {
+			failed++
+			if firstErr == nil {
+				first, firstErr = time.Now(), err
+			}
+			last = time.Now()
+		}
+	}
+	var parts []string
+	for c, n := range counts {
+		parts = append(parts, fmt.Sprintf("%s:%d", c, n))
+	}
+	slices.Sort(parts)
+	out := fmt.Sprintf("LOOP calls=%d failed=%d codes=%s", calls, failed, strings.Join(parts, ","))
+	if firstErr != nil {
+		out += fmt.Sprintf(" failing=%s..%s first=%q", first.Format("15:04:05.000"), last.Format("15:04:05.000"), status.Convert(firstErr).Message())
+	}
+	fmt.Println(out)
 }
 
 func callStream(ctx context.Context, cc *grpc.ClientConn, method string) error {

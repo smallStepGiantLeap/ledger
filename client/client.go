@@ -28,11 +28,16 @@
 //     enforcement floor, so the platform never answers with too_many_pings.
 //   - Reconnect backoff from 100ms up to 5s instead of grpc-go's 1s-120s, so
 //     a restarted peer is reachable again within seconds.
+//   - Trace context: every call sends the W3C traceparent of its context,
+//     using the global propagator (services the platform generates install
+//     it at startup), so the mesh's spans for this call join the caller's
+//     trace instead of starting a new one.
 package client
 
 import (
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
@@ -55,6 +60,7 @@ func DialOptions() []grpc.DialOption {
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultServiceConfig(ServiceConfig),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithConnectParams(grpc.ConnectParams{Backoff: bo, MinConnectTimeout: 5 * time.Second}),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                20 * time.Second,

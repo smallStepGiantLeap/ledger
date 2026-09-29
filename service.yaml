@@ -8,3 +8,6 @@ spec:
   inbound:
     - repo: smallStepGiantLeap/echo
       methods: [ledger.v1.LedgerService/GetBalance]
+  outbound:
+    # A payment processor: a dependency outside the mesh, reached over TLS.
+    - host: api.stripe.com:443

@@ -1,0 +1,10 @@
+apiVersion: vikrant.smallstepgiantleap.dev/v1alpha1
+kind: Service
+metadata:
+  name: ledger
+spec:
+  language: go
+  proto: proto/ledger/v1/ledger.proto
+  inbound:
+    - repo: smallStepGiantLeap/echo
+      methods: [ledger.v1.LedgerService/GetBalance]

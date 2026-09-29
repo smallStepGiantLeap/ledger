@@ -1,0 +1,5 @@
+bin/
+*.test
+e2e/.bin/
+e2e/.deps/
+e2e/.work/

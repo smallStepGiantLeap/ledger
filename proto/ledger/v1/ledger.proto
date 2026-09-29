@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+service LedgerService {
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // Transfer moves money: never retried unless the request never arrived.
+  rpc Transfer(TransferRequest) returns (TransferResponse);
+}
+
+message GetBalanceRequest { string account = 1; }
+message GetBalanceResponse { int64 cents = 1; }
+message TransferRequest { string from = 1; string to = 2; int64 cents = 3; }
+message TransferResponse { string id = 1; }

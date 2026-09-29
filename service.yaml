@@ -5,9 +5,11 @@ metadata:
 spec:
   language: go
   proto: proto/ledger/v1/ledger.proto
-  inbound:
-    - repo: smallStepGiantLeap/echo
+  authorizedCallers:
+    - service: smallStepGiantLeap/echo
       methods: [ledger.v1.LedgerService/GetBalance]
-  outbound:
+  ingress:
+    - service: smallStepGiantLeap/echo
+  egress:
     # A payment processor: a dependency outside the mesh, reached over TLS.
     - host: api.stripe.com:443

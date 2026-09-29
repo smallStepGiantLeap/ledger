@@ -335,17 +335,17 @@ for env in deploy/envs/*/; do
 done
 
 echo
-echo "== who may call $NAME (inbound)"
-check reach "echo is granted ledger.v1.LedgerService/GetBalance" -- probe_as echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
-check deny "echo is not granted ledger.v1.LedgerService/Transfer: Istio denies it by identity" -- probe_as echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/Transfer
-check blocked "an undeclared namespace is stopped by NetworkPolicy before it reaches the mesh" -- probe_as intruder intruder intruder -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
+echo "== who may call $NAME (authorizedCallers, ingress)"
+check reach "echo is authorized for ledger.v1.LedgerService/GetBalance" -- probe_as echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
+check deny "echo is admitted by ingress but not authorized for ledger.v1.LedgerService/Transfer: Istio denies it by identity" -- probe_as echo echo echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/Transfer
+check blocked "a namespace not in ingress is stopped by NetworkPolicy before it reaches the mesh" -- probe_as intruder intruder intruder -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
 check deny "a pod in echo wearing app=echo but running as another service account passes NetworkPolicy; Istio denies it by identity" -- probe_as echo impostor echo -- -target ledger.ledger.svc.cluster.local:50051 -method /ledger.v1.LedgerService/GetBalance
 
 echo
-echo "== what $NAME may call (outbound, from inside its own pod)"
-check dial-ok "api.stripe.com:443 is declared in outbound" -- probe_inside -- -dial api.stripe.com:443
-check blocked "decoy is not in outbound: the Sidecar and NetworkPolicy both refuse it" -- probe_inside -- -target decoy.decoy.svc.cluster.local:50051 -method /grpc.health.v1.Health/Check
-check dial-fail "example.com is not in outbound" -- probe_inside -- -dial example.com:443
+echo "== what $NAME may connect to (egress, from inside its own pod)"
+check dial-ok "api.stripe.com:443 is in egress" -- probe_inside -- -dial api.stripe.com:443
+check blocked "decoy is not in egress: the Sidecar and NetworkPolicy both refuse it" -- probe_inside -- -target decoy.decoy.svc.cluster.local:50051 -method /grpc.health.v1.Health/Check
+check dial-fail "example.com is not in egress" -- probe_inside -- -dial example.com:443
 
 echo
 echo "== autoscaling and rollout (staging's canary pace)"
